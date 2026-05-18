@@ -1,5 +1,4 @@
 from fastmcp import FastMCP
-import aiosqlite
 import asyncio
 import calendar
 import csv
@@ -8,11 +7,18 @@ import json
 import os
 import tempfile
 
+from sqlalchemy import and_, delete, func, select
+
+from db import get_session
+from models import Budget, Expense, RecurringExpense, RecurringExpenseEntry
+
+
 BASE_DIR = os.path.dirname(__file__)
 CATEGORIES_PATH = os.environ.get(
     "EXPENSE_TRACKER_CATEGORIES_PATH",
     os.path.join(BASE_DIR, "categories.json")
 )
+
 
 def is_writable_dir(path):
     try:
@@ -24,6 +30,7 @@ def is_writable_dir(path):
     except OSError:
         return False
 
+
 def default_data_dir():
     configured_data_dir = os.environ.get("EXPENSE_TRACKER_DATA_DIR")
     if configured_data_dir:
@@ -34,98 +41,24 @@ def default_data_dir():
 
     return os.path.join(tempfile.gettempdir(), "expense-tracker")
 
+
 DATA_DIR = default_data_dir()
-DB_PATH = os.environ.get(
-    "EXPENSE_TRACKER_DB_PATH",
-    os.path.join(DATA_DIR, "expenses.db")
-)
 EXPORTS_PATH = os.environ.get(
     "EXPENSE_TRACKER_EXPORTS_PATH",
     os.path.join(DATA_DIR, "exports")
 )
 
 mcp = FastMCP("ExpenseTracker")
-_db_initialized = False
-_db_init_lock = None
 
-def db_connect():
-    return aiosqlite.connect(DB_PATH, timeout=30)
-
-def get_db_init_lock():
-    global _db_init_lock
-    if _db_init_lock is None:
-        _db_init_lock = asyncio.Lock()
-    return _db_init_lock
-
-def ensure_parent_dir(path):
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-
-async def init_db():
-    ensure_parent_dir(DB_PATH)
-    async with db_connect() as c:
-        await c.execute("""
-            CREATE TABLE IF NOT EXISTS expenses(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                amount REAL NOT NULL,
-                category TEXT NOT NULL,
-                subcategory TEXT DEFAULT '',
-                note TEXT DEFAULT ''
-            )
-        """)
-        await c.execute("""
-            CREATE TABLE IF NOT EXISTS recurring_expenses(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                start_date TEXT NOT NULL,
-                amount REAL NOT NULL,
-                category TEXT NOT NULL,
-                subcategory TEXT DEFAULT '',
-                note TEXT DEFAULT '',
-                months INTEGER NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1
-            )
-        """)
-        await c.execute("""
-            CREATE TABLE IF NOT EXISTS recurring_expense_entries(
-                recurring_id INTEGER NOT NULL,
-                expense_id INTEGER NOT NULL,
-                PRIMARY KEY (recurring_id, expense_id),
-                FOREIGN KEY (recurring_id) REFERENCES recurring_expenses(id),
-                FOREIGN KEY (expense_id) REFERENCES expenses(id)
-            )
-        """)
-        await c.execute("""
-            CREATE TABLE IF NOT EXISTS budgets(
-                year_month TEXT NOT NULL,
-                category TEXT NOT NULL,
-                amount REAL NOT NULL,
-                PRIMARY KEY (year_month, category)
-            )
-        """)
-        await c.commit()
-
-async def ensure_db():
-    global _db_initialized
-    if _db_initialized:
-        return
-
-    async with get_db_init_lock():
-        if not _db_initialized:
-            await init_db()
-            _db_initialized = True
 
 async def load_categories():
     return await asyncio.to_thread(read_categories)
+
 
 def read_categories():
     with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
-async def rows_to_dicts(cur):
-    cols = [d[0] for d in cur.description]
-    return [dict(zip(cols, r)) for r in await cur.fetchall()]
 
 async def validate_category_pair(category, subcategory=""):
     valid_categories = await load_categories()
@@ -138,6 +71,33 @@ async def validate_category_pair(category, subcategory=""):
 
     return True, "Category is valid"
 
+
+def parse_date(date_text, field_name="date"):
+    try:
+        return datetime.strptime(date_text, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} must use YYYY-MM-DD format")
+
+
+def parse_year_month(year_month):
+    try:
+        return datetime.strptime(year_month, "%Y-%m").date()
+    except (TypeError, ValueError):
+        raise ValueError("year_month must use YYYY-MM format")
+
+
+def parse_positive_amount(amount):
+    try:
+        parsed_amount = float(amount)
+    except (TypeError, ValueError):
+        raise ValueError("amount must be a number")
+
+    if parsed_amount <= 0:
+        raise ValueError("amount must be greater than zero")
+
+    return parsed_amount
+
+
 async def validate_expense_data(expense):
     required_fields = ("date", "amount", "category")
     missing_fields = [field for field in required_fields if field not in expense]
@@ -146,17 +106,13 @@ async def validate_expense_data(expense):
         return False, f"Missing required fields: {', '.join(missing_fields)}"
 
     try:
-        amount = float(expense["amount"])
-    except (TypeError, ValueError):
-        return False, "amount must be a number"
-
-    if amount <= 0:
-        return False, "amount must be greater than zero"
+        parse_date(expense["date"])
+        parse_positive_amount(expense["amount"])
+    except ValueError as exc:
+        return False, str(exc)
 
     return await validate_category_pair(expense["category"], expense.get("subcategory", ""))
 
-def parse_monthly_date(date_text):
-    return datetime.strptime(date_text, "%Y-%m-%d").date()
 
 def add_months(date_value, months):
     month_index = date_value.month - 1 + months
@@ -165,19 +121,30 @@ def add_months(date_value, months):
     day = min(date_value.day, calendar.monthrange(year, month)[1])
     return date_value.replace(year=year, month=month, day=day)
 
+
+def expense_to_dict(expense):
+    return {
+        "id": expense.id,
+        "date": expense.date.isoformat(),
+        "amount": expense.amount,
+        "category": expense.category,
+        "subcategory": expense.subcategory,
+        "note": expense.note,
+    }
+
+
 async def get_expenses_for_range(start_date, end_date):
-    await ensure_db()
-    async with db_connect() as c:
-        cur = await c.execute(
-            """
-            SELECT id, date, amount, category, subcategory, note
-            FROM expenses
-            WHERE date BETWEEN ? AND ?
-            ORDER BY date ASC, id ASC
-            """,
-            (start_date, end_date)
+    start = parse_date(start_date, "start_date")
+    end = parse_date(end_date, "end_date")
+
+    async with get_session() as session:
+        result = await session.scalars(
+            select(Expense)
+            .where(Expense.date.between(start, end))
+            .order_by(Expense.date.asc(), Expense.id.asc())
         )
-        return await rows_to_dicts(cur)
+        return [expense_to_dict(expense) for expense in result.all()]
+
 
 def safe_filename_part(value):
     return "".join(
@@ -185,8 +152,10 @@ def safe_filename_part(value):
         for char in str(value)
     )
 
+
 def escape_pdf_text(value):
     return str(value).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
 
 def write_simple_pdf(path, title, lines):
     text_lines = [title, "", *lines]
@@ -228,6 +197,7 @@ def write_simple_pdf(path, title, lines):
             f"startxref\n{xref_offset}\n%%EOF\n".encode("ascii")
         )
 
+
 def write_csv_export(path, rows):
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
@@ -237,11 +207,13 @@ def write_csv_export(path, rows):
         writer.writeheader()
         writer.writerows(rows)
 
+
 @mcp.tool()
 async def validate_category(category, subcategory=""):
     '''Validate a category and optional subcategory against categories.json.'''
     is_valid, message = await validate_category_pair(category, subcategory)
     return {"status": "ok" if is_valid else "error", "message": message}
+
 
 @mcp.tool()
 async def add_expense(date, amount, category, subcategory="", note=""):
@@ -250,14 +222,24 @@ async def add_expense(date, amount, category, subcategory="", note=""):
     if not is_valid:
         return {"status": "error", "message": message}
 
-    await ensure_db()
-    async with db_connect() as c:
-        cur = await c.execute(
-            "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
-            (date, amount, category, subcategory, note)
+    try:
+        expense_date = parse_date(date)
+        amount = parse_positive_amount(amount)
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}
+
+    async with get_session() as session:
+        expense = Expense(
+            date=expense_date,
+            amount=amount,
+            category=category,
+            subcategory=subcategory,
+            note=note,
         )
-        await c.commit()
-        return {"status": "ok", "id": cur.lastrowid}
+        session.add(expense)
+        await session.commit()
+        return {"status": "ok", "id": expense.id}
+
 
 @mcp.tool()
 async def bulk_add_expenses(expenses):
@@ -265,6 +247,7 @@ async def bulk_add_expenses(expenses):
     if not isinstance(expenses, list) or not expenses:
         return {"status": "error", "message": "Expenses must be a non-empty list"}
 
+    prepared_expenses = []
     for index, expense in enumerate(expenses, start=1):
         if not isinstance(expense, dict):
             return {"status": "error", "message": f"Expense #{index} must be an object"}
@@ -273,25 +256,23 @@ async def bulk_add_expenses(expenses):
         if not is_valid:
             return {"status": "error", "message": f"Expense #{index}: {message}"}
 
-    await ensure_db()
-    async with db_connect() as c:
-        ids = []
-
-        for expense in expenses:
-            cur = await c.execute(
-                "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
-                (
-                    expense["date"],
-                    expense["amount"],
-                    expense["category"],
-                    expense.get("subcategory", ""),
-                    expense.get("note", "")
-                )
+        prepared_expenses.append(
+            Expense(
+                date=parse_date(expense["date"]),
+                amount=parse_positive_amount(expense["amount"]),
+                category=expense["category"],
+                subcategory=expense.get("subcategory", ""),
+                note=expense.get("note", ""),
             )
-            ids.append(cur.lastrowid)
+        )
 
-        await c.commit()
+    async with get_session() as session:
+        session.add_all(prepared_expenses)
+        await session.flush()
+        ids = [expense.id for expense in prepared_expenses]
+        await session.commit()
         return {"status": "ok", "count": len(ids), "ids": ids}
+
 
 @mcp.tool()
 async def recurring_expense(start_date, amount, category, subcategory="", note="", months=12):
@@ -301,122 +282,101 @@ async def recurring_expense(start_date, amount, category, subcategory="", note="
         return {"status": "error", "message": message}
 
     try:
-        amount = float(amount)
-    except (TypeError, ValueError):
-        return {"status": "error", "message": "amount must be a number"}
-
-    if amount <= 0:
-        return {"status": "error", "message": "amount must be greater than zero"}
-
-    try:
-        start = parse_monthly_date(start_date)
-    except ValueError:
-        return {"status": "error", "message": "start_date must use YYYY-MM-DD format"}
-
-    try:
+        start = parse_date(start_date, "start_date")
+        amount = parse_positive_amount(amount)
         months = int(months)
-    except (TypeError, ValueError):
-        return {"status": "error", "message": "months must be a number"}
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}
 
     months = max(1, min(months, 120))
 
-    await ensure_db()
-    async with db_connect() as c:
-        cur = await c.execute(
-            """
-            INSERT INTO recurring_expenses(start_date, amount, category, subcategory, note, months)
-            VALUES (?,?,?,?,?,?)
-            """,
-            (start_date, amount, category, subcategory, note, months)
+    async with get_session() as session:
+        recurring = RecurringExpense(
+            start_date=start,
+            amount=amount,
+            category=category,
+            subcategory=subcategory,
+            note=note,
+            months=months,
+            active=True,
         )
-        recurring_id = cur.lastrowid
+        session.add(recurring)
+        await session.flush()
+
         expense_ids = []
-
         for month_offset in range(months):
-            expense_date = add_months(start, month_offset).isoformat()
-            cur = await c.execute(
-                "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
-                (expense_date, amount, category, subcategory, note)
+            expense = Expense(
+                date=add_months(start, month_offset),
+                amount=amount,
+                category=category,
+                subcategory=subcategory,
+                note=note,
             )
-            expense_id = cur.lastrowid
-            expense_ids.append(expense_id)
-            await c.execute(
-                """
-                INSERT INTO recurring_expense_entries(recurring_id, expense_id)
-                VALUES (?,?)
-                """,
-                (recurring_id, expense_id)
+            session.add(expense)
+            await session.flush()
+            expense_ids.append(expense.id)
+            session.add(
+                RecurringExpenseEntry(
+                    recurring_id=recurring.id,
+                    expense_id=expense.id,
+                )
             )
 
-        await c.commit()
+        await session.commit()
         return {
             "status": "ok",
-            "recurring_id": recurring_id,
+            "recurring_id": recurring.id,
             "count": len(expense_ids),
-            "expense_ids": expense_ids
+            "expense_ids": expense_ids,
         }
-    
+
+
 @mcp.tool()
 async def list_expenses(start_date, end_date):
     '''List expense entries within an inclusive date range.'''
-    await ensure_db()
-    async with db_connect() as c:
-        cur = await c.execute(
-            """
-            SELECT id, date, amount, category, subcategory, note
-            FROM expenses
-            WHERE date BETWEEN ? AND ?
-            ORDER BY id ASC
-            """,
-            (start_date, end_date)
+    try:
+        start = parse_date(start_date, "start_date")
+        end = parse_date(end_date, "end_date")
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}
+
+    async with get_session() as session:
+        result = await session.scalars(
+            select(Expense)
+            .where(Expense.date.between(start, end))
+            .order_by(Expense.id.asc())
         )
-        return await rows_to_dicts(cur)
+        return [expense_to_dict(expense) for expense in result.all()]
+
 
 @mcp.tool()
 async def get_expense(id):
     '''Get a single expense entry by id.'''
-    await ensure_db()
-    async with db_connect() as c:
-        cur = await c.execute(
-            """
-            SELECT id, date, amount, category, subcategory, note
-            FROM expenses
-            WHERE id = ?
-            """,
-            (id,)
-        )
-        row = await cur.fetchone()
+    async with get_session() as session:
+        expense = await session.get(Expense, id)
 
-        if row is None:
+        if expense is None:
             return {"status": "error", "message": f"Expense with id {id} not found"}
 
-        cols = [d[0] for d in cur.description]
-        return dict(zip(cols, row))
+        return expense_to_dict(expense)
+
 
 @mcp.tool()
 async def edit_expense(id, date=None, amount=None, category=None, subcategory=None, note=None):
     '''Edit an existing expense entry. Only provided fields will be updated.'''
-    await ensure_db()
-    async with db_connect() as c:
+    async with get_session() as session:
+        expense = await session.get(Expense, id)
+        if expense is None:
+            return {"status": "error", "message": f"Expense with id {id} not found"}
+
+        next_category = category if category is not None else expense.category
+        next_subcategory = subcategory if subcategory is not None else expense.subcategory
         if category is not None or subcategory is not None:
-            cur = await c.execute(
-                "SELECT category, subcategory FROM expenses WHERE id = ?",
-                (id,)
-            )
-            row = await cur.fetchone()
-
-            if row is None:
-                return {"status": "error", "message": f"Expense with id {id} not found"}
-
-            current_category, current_subcategory = row
-            next_category = category if category is not None else current_category
-            next_subcategory = subcategory if subcategory is not None else current_subcategory
             is_valid, message = await validate_category_pair(next_category, next_subcategory)
-
             if not is_valid:
                 return {"status": "error", "message": message}
 
-        fields = {
+        provided_fields = {
             "date": date,
             "amount": amount,
             "category": category,
@@ -425,65 +385,73 @@ async def edit_expense(id, date=None, amount=None, category=None, subcategory=No
         }
         provided_fields = {
             field: value
-            for field, value in fields.items()
+            for field, value in provided_fields.items()
             if value is not None
         }
-        
+
         if not provided_fields:
             return {"status": "error", "message": "No fields to update"}
-        
-        updates = [f"{field} = ?" for field in provided_fields]
-        params = [*provided_fields.values(), id]
-        query = f"UPDATE expenses SET {', '.join(updates)} WHERE id = ?"
-        cur = await c.execute(query, params)
-        await c.commit()
-        
-        if cur.rowcount == 0:
-            return {"status": "error", "message": f"Expense with id {id} not found"}
-        
+
+        try:
+            if date is not None:
+                expense.date = parse_date(date)
+            if amount is not None:
+                expense.amount = parse_positive_amount(amount)
+        except ValueError as exc:
+            return {"status": "error", "message": str(exc)}
+
+        if category is not None:
+            expense.category = category
+        if subcategory is not None:
+            expense.subcategory = subcategory
+        if note is not None:
+            expense.note = note
+
+        await session.commit()
         return {"status": "ok", "message": f"Updated expense {id}"}
+
 
 @mcp.tool()
 async def delete_expense(id):
     '''Delete an expense entry by id.'''
-    await ensure_db()
-    async with db_connect() as c:
-        cur = await c.execute("DELETE FROM expenses WHERE id = ?", (id,))
-        await c.commit()
-        
-        if cur.rowcount == 0:
+    async with get_session() as session:
+        result = await session.execute(delete(Expense).where(Expense.id == id))
+        await session.commit()
+
+        if result.rowcount == 0:
             return {"status": "error", "message": f"Expense with id {id} not found"}
-        
+
         return {"status": "ok", "message": f"Deleted expense {id}"}
+
 
 @mcp.tool()
 async def search_expenses(date=None, category=None, amount=None, min_amount=None, max_amount=None):
     '''Search expenses by criteria. Returns all matching entries with IDs.'''
-    await ensure_db()
-    async with db_connect() as c:
-        conditions = []
-        params = []
-        
-        # Build dynamic WHERE clauses
-        field_map = {'date': date, 'category': category, 'amount': amount}
-        for field, value in field_map.items():
-            if value is not None:
-                conditions.append(f"{field} = ?")
-                params.append(value)
-        
+    conditions = []
+
+    try:
+        if date is not None:
+            conditions.append(Expense.date == parse_date(date))
+        if amount is not None:
+            conditions.append(Expense.amount == float(amount))
         if min_amount is not None:
-            conditions.append("amount >= ?")
-            params.append(min_amount)
-        
+            conditions.append(Expense.amount >= float(min_amount))
         if max_amount is not None:
-            conditions.append("amount <= ?")
-            params.append(max_amount)
-        
-        where_clause = " AND ".join(conditions) if conditions else "1=1"
-        query = f"SELECT id, date, amount, category, subcategory, note FROM expenses WHERE {where_clause} ORDER BY date DESC, id DESC"
-        
-        cur = await c.execute(query, params)
-        return await rows_to_dicts(cur)
+            conditions.append(Expense.amount <= float(max_amount))
+    except (TypeError, ValueError) as exc:
+        return {"status": "error", "message": str(exc)}
+
+    if category is not None:
+        conditions.append(Expense.category == category)
+
+    query = select(Expense).order_by(Expense.date.desc(), Expense.id.desc())
+    if conditions:
+        query = query.where(and_(*conditions))
+
+    async with get_session() as session:
+        result = await session.scalars(query)
+        return [expense_to_dict(expense) for expense in result.all()]
+
 
 @mcp.tool()
 async def recent_expenses(limit=10):
@@ -495,62 +463,65 @@ async def recent_expenses(limit=10):
 
     limit = max(1, min(limit, 100))
 
-    await ensure_db()
-    async with db_connect() as c:
-        cur = await c.execute(
-            """
-            SELECT id, date, amount, category, subcategory, note
-            FROM expenses
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,)
+    async with get_session() as session:
+        result = await session.scalars(
+            select(Expense).order_by(Expense.id.desc()).limit(limit)
         )
-        return await rows_to_dicts(cur)
+        return [expense_to_dict(expense) for expense in result.all()]
+
 
 @mcp.tool()
 async def summarize(start_date, end_date, category=None):
     '''Summarize expenses by category within an inclusive date range.'''
-    await ensure_db()
-    async with db_connect() as c:
-        query = (
-            """
-            SELECT category, SUM(amount) AS total_amount
-            FROM expenses
-            WHERE date BETWEEN ? AND ?
-            """
-        )
-        params = [start_date, end_date]
+    try:
+        start = parse_date(start_date, "start_date")
+        end = parse_date(end_date, "end_date")
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}
 
-        if category:
-            query += " AND category = ?"
-            params.append(category)
+    query = (
+        select(Expense.category, func.sum(Expense.amount).label("total_amount"))
+        .where(Expense.date.between(start, end))
+        .group_by(Expense.category)
+        .order_by(Expense.category.asc())
+    )
 
-        query += " GROUP BY category ORDER BY category ASC"
+    if category:
+        query = query.where(Expense.category == category)
 
-        cur = await c.execute(query, params)
-        return await rows_to_dicts(cur)
+    async with get_session() as session:
+        result = await session.execute(query)
+        return [
+            {"category": row.category, "total_amount": float(row.total_amount or 0)}
+            for row in result.all()
+        ]
+
 
 @mcp.tool()
 async def summarize_by_month(year):
     '''Summarize total expenses for each month in a year.'''
     year = str(year)
-    start_date = f"{year}-01-01"
-    end_date = f"{year}-12-31"
+    try:
+        start = parse_date(f"{year}-01-01", "year")
+        end = parse_date(f"{year}-12-31", "year")
+    except ValueError:
+        return {"status": "error", "message": "year must use YYYY format"}
 
-    await ensure_db()
-    async with db_connect() as c:
-        cur = await c.execute(
-            """
-            SELECT substr(date, 1, 7) AS month, SUM(amount) AS total_amount
-            FROM expenses
-            WHERE date BETWEEN ? AND ?
-            GROUP BY month
-            ORDER BY month ASC
-            """,
-            (start_date, end_date)
-        )
-        return await rows_to_dicts(cur)
+    month_expr = func.to_char(Expense.date, "YYYY-MM")
+    query = (
+        select(month_expr.label("month"), func.sum(Expense.amount).label("total_amount"))
+        .where(Expense.date.between(start, end))
+        .group_by(month_expr)
+        .order_by(month_expr.asc())
+    )
+
+    async with get_session() as session:
+        result = await session.execute(query)
+        return [
+            {"month": row.month, "total_amount": float(row.total_amount or 0)}
+            for row in result.all()
+        ]
+
 
 @mcp.tool()
 async def export_expenses(start_date, end_date, format="csv"):
@@ -559,7 +530,11 @@ async def export_expenses(start_date, end_date, format="csv"):
     if format not in ("csv", "pdf"):
         return {"status": "error", "message": "format must be csv or pdf"}
 
-    rows = await get_expenses_for_range(start_date, end_date)
+    try:
+        rows = await get_expenses_for_range(start_date, end_date)
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}
+
     await asyncio.to_thread(os.makedirs, EXPORTS_PATH, exist_ok=True)
     safe_start = safe_filename_part(start_date)
     safe_end = safe_filename_part(end_date)
@@ -580,63 +555,55 @@ async def export_expenses(start_date, end_date, format="csv"):
             write_simple_pdf,
             path,
             f"Expenses from {start_date} to {end_date}",
-            lines
+            lines,
         )
 
     return {"status": "ok", "format": format, "count": len(rows), "path": path}
+
 
 @mcp.tool()
 async def budget_set(year_month, category, amount):
     '''Set or update a monthly budget for a category. year_month should be YYYY-MM.'''
     try:
-        datetime.strptime(year_month, "%Y-%m")
-    except ValueError:
-        return {"status": "error", "message": "year_month must use YYYY-MM format"}
-
-    try:
-        amount = float(amount)
-    except (TypeError, ValueError):
-        return {"status": "error", "message": "amount must be a number"}
-
-    if amount <= 0:
-        return {"status": "error", "message": "amount must be greater than zero"}
+        parse_year_month(year_month)
+        amount = parse_positive_amount(amount)
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}
 
     is_valid, message = await validate_category_pair(category)
     if not is_valid:
         return {"status": "error", "message": message}
 
-    await ensure_db()
-    async with db_connect() as c:
-        await c.execute(
-            """
-            INSERT INTO budgets(year_month, category, amount)
-            VALUES (?,?,?)
-            ON CONFLICT(year_month, category) DO UPDATE SET amount = excluded.amount
-            """,
-            (year_month, category, amount)
+    async with get_session() as session:
+        budget = await session.get(
+            Budget,
+            {"year_month": year_month, "category": category},
         )
-        await c.commit()
+        if budget is None:
+            budget = Budget(year_month=year_month, category=category, amount=amount)
+            session.add(budget)
+        else:
+            budget.amount = amount
+
+        await session.commit()
 
     return {
         "status": "ok",
         "message": f"Budget set for {category} in {year_month}",
         "year_month": year_month,
         "category": category,
-        "amount": amount
+        "amount": amount,
     }
+
 
 @mcp.tool()
 async def budget_check(year_month, category=None, warning_threshold=0.8):
     '''Check monthly spending against category budgets.'''
     try:
-        month_start = datetime.strptime(year_month, "%Y-%m").date()
-    except ValueError:
-        return {"status": "error", "message": "year_month must use YYYY-MM format"}
-
-    try:
+        month_start = parse_year_month(year_month)
         warning_threshold = float(warning_threshold)
-    except (TypeError, ValueError):
-        return {"status": "error", "message": "warning_threshold must be a number"}
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}
 
     warning_threshold = max(0, min(warning_threshold, 1))
 
@@ -649,32 +616,25 @@ async def budget_check(year_month, category=None, warning_threshold=0.8):
         day=calendar.monthrange(month_start.year, month_start.month)[1]
     )
 
-    await ensure_db()
-    async with db_connect() as c:
-        query = "SELECT category, amount FROM budgets WHERE year_month = ?"
-        params = [year_month]
+    budget_query = select(Budget).where(Budget.year_month == year_month)
+    if category is not None:
+        budget_query = budget_query.where(Budget.category == category)
 
-        if category is not None:
-            query += " AND category = ?"
-            params.append(category)
-
-        cur = await c.execute(query, params)
-        budgets = await cur.fetchall()
+    async with get_session() as session:
+        budgets = (await session.scalars(budget_query)).all()
         results = []
 
-        for budget_category, budget_amount in budgets:
-            cur = await c.execute(
-                """
-                SELECT COALESCE(SUM(amount), 0)
-                FROM expenses
-                WHERE date BETWEEN ? AND ? AND category = ?
-                """,
-                (month_start.isoformat(), month_end.isoformat(), budget_category)
+        for budget in budgets:
+            spent_amount = await session.scalar(
+                select(func.coalesce(func.sum(Expense.amount), 0.0)).where(
+                    Expense.date.between(month_start, month_end),
+                    Expense.category == budget.category,
+                )
             )
-            spent_amount = (await cur.fetchone())[0]
-            usage_percent = (spent_amount / budget_amount) if budget_amount else 0
+            spent_amount = float(spent_amount or 0)
+            usage_percent = (spent_amount / budget.amount) if budget.amount else 0
 
-            if spent_amount > budget_amount:
+            if spent_amount > budget.amount:
                 status = "over_budget"
             elif usage_percent >= warning_threshold:
                 status = "near_limit"
@@ -682,23 +642,26 @@ async def budget_check(year_month, category=None, warning_threshold=0.8):
                 status = "ok"
 
             results.append({
-                "category": budget_category,
-                "budget_amount": budget_amount,
+                "category": budget.category,
+                "budget_amount": budget.amount,
                 "spent_amount": spent_amount,
-                "remaining_amount": budget_amount - spent_amount,
+                "remaining_amount": budget.amount - spent_amount,
                 "usage_percent": round(usage_percent * 100, 2),
-                "status": status
+                "status": status,
             })
 
     return {"status": "ok", "year_month": year_month, "budgets": results}
+
 
 @mcp.resource("expense://categories", mime_type="application/json")
 async def categories():
     return await asyncio.to_thread(read_categories_text)
 
+
 def read_categories_text():
     with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
         return f.read()
+
 
 if __name__ == "__main__":
     mcp.run(transport="http", host="0.0.0.0", port=8000)
