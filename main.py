@@ -412,7 +412,7 @@ async def edit_expense(id, date=None, amount=None, category=None, subcategory=No
 
 
 @mcp.tool()
-async def delete_expense(id):
+async def delete_expense(id: int):
     '''Delete an expense entry by id.'''
     async with get_session() as session:
         result = await session.execute(delete(Expense).where(Expense.id == id))
