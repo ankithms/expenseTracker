@@ -5,15 +5,52 @@ from datetime import datetime
 import json
 import os
 import sqlite3
+import tempfile
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "expenses.db")
-CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
-EXPORTS_PATH = os.path.join(os.path.dirname(__file__), "exports")
+BASE_DIR = os.path.dirname(__file__)
+CATEGORIES_PATH = os.environ.get(
+    "EXPENSE_TRACKER_CATEGORIES_PATH",
+    os.path.join(BASE_DIR, "categories.json")
+)
+
+def is_writable_dir(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        fd, test_path = tempfile.mkstemp(prefix=".write-test-", dir=path)
+        os.close(fd)
+        os.remove(test_path)
+        return True
+    except OSError:
+        return False
+
+def default_data_dir():
+    configured_data_dir = os.environ.get("EXPENSE_TRACKER_DATA_DIR")
+    if configured_data_dir:
+        return configured_data_dir
+
+    if is_writable_dir(BASE_DIR):
+        return BASE_DIR
+
+    return os.path.join(tempfile.gettempdir(), "expense-tracker")
+
+DATA_DIR = default_data_dir()
+DB_PATH = os.environ.get(
+    "EXPENSE_TRACKER_DB_PATH",
+    os.path.join(DATA_DIR, "expenses.db")
+)
+EXPORTS_PATH = os.environ.get(
+    "EXPENSE_TRACKER_EXPORTS_PATH",
+    os.path.join(DATA_DIR, "exports")
+)
 
 mcp = FastMCP("ExpenseTracker")
 
+def db_connect():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    return sqlite3.connect(DB_PATH)
+
 def init_db():
-    with sqlite3.connect(DB_PATH) as c:
+    with db_connect() as c:
         c.execute("""
             CREATE TABLE IF NOT EXISTS expenses(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,7 +140,7 @@ def add_months(date_value, months):
     return date_value.replace(year=year, month=month, day=day)
 
 def get_expenses_for_range(start_date, end_date):
-    with sqlite3.connect(DB_PATH) as c:
+    with db_connect() as c:
         cur = c.execute(
             """
             SELECT id, date, amount, category, subcategory, note
@@ -177,7 +214,7 @@ def add_expense(date, amount, category, subcategory="", note=""):
     if not is_valid:
         return {"status": "error", "message": message}
 
-    with sqlite3.connect(DB_PATH) as c:
+    with db_connect() as c:
         cur = c.execute(
             "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
             (date, amount, category, subcategory, note)
@@ -198,7 +235,7 @@ def bulk_add_expenses(expenses):
         if not is_valid:
             return {"status": "error", "message": f"Expense #{index}: {message}"}
 
-    with sqlite3.connect(DB_PATH) as c:
+    with db_connect() as c:
         ids = []
 
         for expense in expenses:
@@ -243,7 +280,7 @@ def recurring_expense(start_date, amount, category, subcategory="", note="", mon
 
     months = max(1, min(months, 120))
 
-    with sqlite3.connect(DB_PATH) as c:
+    with db_connect() as c:
         cur = c.execute(
             """
             INSERT INTO recurring_expenses(start_date, amount, category, subcategory, note, months)
@@ -280,7 +317,7 @@ def recurring_expense(start_date, amount, category, subcategory="", note="", mon
 @mcp.tool()
 def list_expenses(start_date, end_date):
     '''List expense entries within an inclusive date range.'''
-    with sqlite3.connect(DB_PATH) as c:
+    with db_connect() as c:
         cur = c.execute(
             """
             SELECT id, date, amount, category, subcategory, note
@@ -296,7 +333,7 @@ def list_expenses(start_date, end_date):
 @mcp.tool()
 def get_expense(id):
     '''Get a single expense entry by id.'''
-    with sqlite3.connect(DB_PATH) as c:
+    with db_connect() as c:
         cur = c.execute(
             """
             SELECT id, date, amount, category, subcategory, note
@@ -316,7 +353,7 @@ def get_expense(id):
 @mcp.tool()
 def edit_expense(id, date=None, amount=None, category=None, subcategory=None, note=None):
     '''Edit an existing expense entry. Only provided fields will be updated.'''
-    with sqlite3.connect(DB_PATH) as c:
+    with db_connect() as c:
         if category is not None or subcategory is not None:
             cur = c.execute(
                 "SELECT category, subcategory FROM expenses WHERE id = ?",
@@ -364,7 +401,7 @@ def edit_expense(id, date=None, amount=None, category=None, subcategory=None, no
 @mcp.tool()
 def delete_expense(id):
     '''Delete an expense entry by id.'''
-    with sqlite3.connect(DB_PATH) as c:
+    with db_connect() as c:
         cur = c.execute("DELETE FROM expenses WHERE id = ?", (id,))
         
         if cur.rowcount == 0:
@@ -375,7 +412,7 @@ def delete_expense(id):
 @mcp.tool()
 def search_expenses(date=None, category=None, amount=None, min_amount=None, max_amount=None):
     '''Search expenses by criteria. Returns all matching entries with IDs.'''
-    with sqlite3.connect(DB_PATH) as c:
+    with db_connect() as c:
         conditions = []
         params = []
         
@@ -411,7 +448,7 @@ def recent_expenses(limit=10):
 
     limit = max(1, min(limit, 100))
 
-    with sqlite3.connect(DB_PATH) as c:
+    with db_connect() as c:
         cur = c.execute(
             """
             SELECT id, date, amount, category, subcategory, note
@@ -427,7 +464,7 @@ def recent_expenses(limit=10):
 @mcp.tool()
 def summarize(start_date, end_date, category=None):
     '''Summarize expenses by category within an inclusive date range.'''
-    with sqlite3.connect(DB_PATH) as c:
+    with db_connect() as c:
         query = (
             """
             SELECT category, SUM(amount) AS total_amount
@@ -454,7 +491,7 @@ def summarize_by_month(year):
     start_date = f"{year}-01-01"
     end_date = f"{year}-12-31"
 
-    with sqlite3.connect(DB_PATH) as c:
+    with db_connect() as c:
         cur = c.execute(
             """
             SELECT substr(date, 1, 7) AS month, SUM(amount) AS total_amount
@@ -522,7 +559,7 @@ def budget_set(year_month, category, amount):
     if not is_valid:
         return {"status": "error", "message": message}
 
-    with sqlite3.connect(DB_PATH) as c:
+    with db_connect() as c:
         c.execute(
             """
             INSERT INTO budgets(year_month, category, amount)
@@ -564,7 +601,7 @@ def budget_check(year_month, category=None, warning_threshold=0.8):
         day=calendar.monthrange(month_start.year, month_start.month)[1]
     )
 
-    with sqlite3.connect(DB_PATH) as c:
+    with db_connect() as c:
         query = "SELECT category, amount FROM budgets WHERE year_month = ?"
         params = [year_month]
 
@@ -612,4 +649,4 @@ def categories():
         return f.read()
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="http", host="0.0.0.0", port=8000)
