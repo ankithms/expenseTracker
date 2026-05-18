@@ -652,6 +652,38 @@ async def budget_check(year_month, category=None, warning_threshold=0.8):
 
     return {"status": "ok", "year_month": year_month, "budgets": results}
 
+@mcp.tool()
+async def list_recurring_expenses():
+    '''List all recurring expenses.'''
+    async with get_session() as session:
+        result = await session.execute(select(RecurringExpense))
+        rows = result.scalars().all()
+        return [
+            {
+                "id": r.id,
+                "start_date": str(r.start_date),
+                "amount": r.amount,
+                "category": r.category,
+                "subcategory": r.subcategory,
+                "note": r.note,
+                "months": r.months,
+                "active": r.active,
+            }
+            for r in rows
+        ]
+
+
+@mcp.tool()
+async def delete_recurring_expense(id: int):
+    '''Delete a recurring expense and its entries by id.'''
+    async with get_session() as session:
+        result = await session.execute(
+            delete(RecurringExpense).where(RecurringExpense.id == id)
+        )
+        await session.commit()
+        if result.rowcount == 0:
+            return {"status": "error", "message": f"Recurring expense {id} not found"}
+        return {"status": "ok", "message": f"Deleted recurring expense {id}"}
 
 @mcp.resource("expense://categories", mime_type="application/json")
 async def categories():
